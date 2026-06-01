@@ -63,14 +63,14 @@ class TestImpConcolic(CTermSymbolicTest, KPrintTest):
         assert len(trace.path) == 1
         assert 'found |-> 0' in self.found_value(kprint, trace.final)
 
-    def test_flip_branch_produces_diverging_input(self, cterm_symbolic: CTermSymbolic, kprint: KPrint) -> None:
+    def test_diverging_input_produces_other_branch(self, cterm_symbolic: CTermSymbolic, kprint: KPrint) -> None:
         # Given
         init = self.config(kprint)
         engine = ConcolicEngine(cterm_symbolic, input_vars=['N'])
         trace = engine.trace(init, Subst({'N': intToken(10)}))
 
-        # When: negate the single branch to synthesize an input for the other path
-        new_inputs = engine.flipped_inputs(init, trace)
+        # When: use remainder-driven diverging_inputs to synthesize an input for the sibling branch
+        new_inputs = engine.diverging_inputs(init, trace)
 
         # Then
         assert len(new_inputs) == 1
@@ -80,7 +80,7 @@ class TestImpConcolic(CTermSymbolicTest, KPrintTest):
         assert isinstance(new_value, KToken)
         assert int(new_value.token) <= 5
 
-        # And: re-tracing the flipped input takes the other branch (found = 1)
+        # And: re-tracing the diverging input takes the other branch (found = 1)
         new_trace = engine.trace(init, new_input)
         assert new_trace.signature != trace.signature
         assert 'found |-> 1' in self.found_value(kprint, new_trace.final)
@@ -97,3 +97,78 @@ class TestImpConcolic(CTermSymbolicTest, KPrintTest):
         assert len(traces) == 2
         signatures = {trace.signature for trace in traces}
         assert len(signatures) == 2
+
+
+# A two-branch IMP program: two sequential conditionals over a single symbolic input ``n``:
+#   if (n <= 5) { a = 1 ; } else { a = 0 ; }
+#   if (n <= 10) { b = 1 ; } else { b = 0 ; }
+#
+# The feasible path leaves are:
+#   n<=5  ∧  n<=10   (e.g. N=3)
+#   ¬n<=5 ∧  n<=10   (e.g. N=7)
+#   ¬n<=5 ∧ ¬n<=10   (e.g. N=11)
+#
+# The combination n<=5 ∧ ¬n<=10 is UNSAT and must NOT be generated.
+TWO_BRANCH_PGM: str = 'if (n <= 5) { a = 1 ; } else { a = 0 ; } if (n <= 10) { b = 1 ; } else { b = 0 ; }'
+
+
+class TestImpConcolicTwoBranch(CTermSymbolicTest, KPrintTest):
+    KOMPILE_MAIN_FILE = K_FILES / 'imp.k'
+
+    @staticmethod
+    def config(kprint: KPrint) -> CTerm:
+        k_parsed = kprint.parse_token(KToken(TWO_BRANCH_PGM, 'Stmt'), as_rule=False)
+        state_parsed = kprint.parse_token(
+            KToken(
+                '#token("n","Id") |-> N:Int #token("a","Id") |-> 0 #token("b","Id") |-> 0',
+                'Map',
+            ),
+            as_rule=True,
+        )
+        return CTerm(
+            KApply(
+                '<generatedTop>',
+                KApply(
+                    '<T>',
+                    (
+                        KApply('<k>', KSequence(k_parsed)),
+                        KApply('<state>', state_parsed),
+                    ),
+                ),
+                KVariable('GENERATED_COUNTER_CELL'),
+            ),
+        )
+
+    def test_explore_discovers_exactly_three_feasible_paths(
+        self, cterm_symbolic: CTermSymbolic, kprint: KPrint
+    ) -> None:
+        """Remainder-driven exploration finds the 3 feasible leaves and skips the UNSAT one.
+
+        Seed N=3 (takes both true branches):
+        - B1 sibling rk=¬(n<=5): solve prefix=[] ∧ ¬(n<=5) -> N=6 queued
+        - B2 sibling rk=¬(n<=10): solve prefix=[n<=5] ∧ ¬(n<=10) = UNSAT -> pruned
+
+        N=6 (false, true):
+        - B1 sibling rk=(n<=5): solve prefix=[] ∧ (n<=5) -> rediscovers N=3 path, skipped
+        - B2 sibling rk=¬(n<=10): solve prefix=[¬(n<=5)] ∧ ¬(n<=10) -> N=11 queued
+
+        N=11 (false, false):
+        - B1 sibling produces N<=5 path (already seen)
+        - B2 sibling produces ¬(n<=5)∧(n<=10) path (already seen as N=6)
+
+        Result: exactly 3 distinct path signatures.
+        """
+        # Given
+        init = self.config(kprint)
+        engine = ConcolicEngine(cterm_symbolic, input_vars=['N'])
+
+        # When: seed N=3 (both branches take the true side)
+        traces = engine.explore(init, Subst({'N': intToken(3)}))
+
+        # Then: exactly 3 distinct feasible paths are discovered
+        signatures = {trace.signature for trace in traces}
+        assert len(signatures) == 3, f'Expected 3 distinct paths, got {len(signatures)}: {signatures}'
+
+        # All discovered traces must have terminated normally
+        for trace in traces:
+            assert trace.status == 'terminal', f'Trace did not terminate: {trace.status}'

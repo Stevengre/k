@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ..cterm import CTerm
 from ..kast.inner import Subst
-from ..kast.prelude.ml import mlNot
 from ..kore.rpc import LogRewrite, RewriteSuccess, StopReason
 
 if TYPE_CHECKING:
@@ -32,11 +31,16 @@ class PathConstraint:
         depth: The cumulative rewrite depth at which the branch was taken.
         rule_id: The unique id of the rule whose application produced this branch (matched against the
             concrete trace).
+        siblings: The rule predicates of the non-chosen successors at this branch node, converted to
+            KAST. Each sibling condition is the ``rk`` (remainder) for that alternative branch — the
+            sub-space of inputs that would take that branch instead of the chosen one. Siblings whose
+            ``rule_predicate`` is ``None`` are omitted.
     """
 
     condition: KInner
     depth: int
     rule_id: str | None
+    siblings: tuple[KInner, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -70,18 +74,27 @@ class ConcolicEngine:
     run produces an execution trace, which is then *reused* to drive a *symbolic* run down the very
     same path. Because the concrete trace already records which rule fired at every branch, the
     symbolic pass picks each branch by matching rule ids -- it never asks the SMT solver "which
-    branch does this input take?". The solver is consulted only at the end, to negate a prefix of
-    the path condition and synthesize a new input that diverges from the current path (DART/SAGE).
+    branch does this input take?". The solver is consulted only when synthesizing a new diverging
+    input, by solving ``prefix ∧ rk`` where ``rk`` is the sibling (remainder) condition recorded
+    at a branch node (remainder-driven DART).
 
     Concretely, for each input the engine runs two passes against the same Kore backend (so rule
     ids share one namespace):
 
-    1. **Concrete pass** (`concrete_trace`): substitute the concrete input into the configuration and
+    1. **Concrete pass** (``concrete_trace``): substitute the concrete input into the configuration and
        execute. With branch-relevant data ground, execution is deterministic -- no forking -- and the
        ordered list of applied rule ids is harvested from the rewrite logs.
-    2. **Symbolic pass** (`trace`): execute with the input left symbolic. At each branch, follow the
+    2. **Symbolic pass** (``trace``): execute with the input left symbolic. At each branch, follow the
        successor whose rule id appears next in the concrete trace, recording its guard as a path
-       constraint. No per-branch solver call is made.
+       constraint (``ck``) and the sibling successors' guards as remainder conditions (``rk``). No
+       per-branch solver call is made.
+    3. **Diverging inputs** (``diverging_inputs``): for each branch node ``i``, solve
+       ``prefix_{<i} ∧ rk`` for every sibling ``rk``. Each satisfying model is a new concrete input
+       that follows the same path up to branch ``i``, then diverges to a sibling branch. Infeasible
+       siblings are pruned automatically (``get_model`` returns ``None``).
+
+    This remainder-driven approach handles multi-way branches correctly (no manual negation of
+    ``ck``) and guarantees that every generated input explores a genuinely new, feasible path.
 
     Attributes:
         cterm_symbolic: The symbolic execution interface (wraps a running Kore RPC server).
@@ -150,7 +163,9 @@ class ConcolicEngine:
         """Symbolically replay `init` along the path that `concrete_input` takes concretely.
 
         First computes the concrete rule trace, then executes with the input left symbolic, selecting
-        each branch by matching rule ids against that trace (no per-branch solver call).
+        each branch by matching rule ids against that trace (no per-branch solver call). At each
+        branch, the sibling (non-chosen) successors' predicates are recorded as remainder conditions
+        (``rk``) on the ``PathConstraint``, enabling remainder-driven input generation.
 
         Args:
             init: The initial symbolic configuration, with the `input_vars` left free.
@@ -184,18 +199,31 @@ class ConcolicEngine:
                 cterm = self._to_cterm(next_states[0])
                 continue
 
-            chosen, trace_idx = self._match_branch(next_states, rule_trace, trace_idx)
+            chosen, siblings, trace_idx = self._match_branch(next_states, rule_trace, trace_idx)
             if chosen is None:
                 _LOGGER.warning('No branch matched the concrete rule trace; stopping trace')
                 cterm = self._to_cterm(result.state)
                 status = 'undetermined'
                 break
 
+            # Collect remainder (rk) conditions from sibling successors.
+            sibling_conditions: list[KInner] = []
+            for ns in siblings:
+                if ns.rule_predicate is not None:
+                    sibling_conditions.append(self.cterm_symbolic.kore_to_kast(ns.rule_predicate))
+
             cterm = self._to_cterm(chosen)
             if chosen.rule_predicate is not None:
                 condition = self.cterm_symbolic.kore_to_kast(chosen.rule_predicate)
                 cterm = cterm.add_constraint(condition)
-                path.append(PathConstraint(condition=condition, depth=total_depth, rule_id=chosen.rule_id))
+                path.append(
+                    PathConstraint(
+                        condition=condition,
+                        depth=total_depth,
+                        rule_id=chosen.rule_id,
+                        siblings=tuple(sibling_conditions),
+                    )
+                )
 
         return ConcolicTrace(
             input=concrete_input,
@@ -205,41 +233,46 @@ class ConcolicEngine:
             rule_trace=rule_trace,
         )
 
-    def flipped_inputs(self, init: CTerm, trace: ConcolicTrace) -> list[Subst]:
-        """Synthesize new concrete inputs by negating each prefix of `trace`'s path condition.
+    def diverging_inputs(self, init: CTerm, trace: ConcolicTrace) -> list[Subst]:
+        """Synthesize new concrete inputs by solving prefix conditions against sibling (remainder) conditions.
 
-        For each branch ``i`` along the path, the engine builds the constraint set
-        ``c_0 & ... & c_(i-1) & not c_i`` and asks the SMT solver for a satisfying model over the
-        `input_vars`. Each feasible model is a concrete input that diverges from `trace` at branch ``i``.
+        For each branch node ``i`` along the path, and for each sibling (remainder) condition ``rk``
+        recorded at that node, builds the constraint set ``c_0 & ... & c_(i-1) & rk`` and asks the
+        SMT solver for a satisfying model over the ``input_vars``. Each feasible model is a new
+        concrete input that follows the same path up to branch ``i``, then diverges to the sibling
+        branch guarded by ``rk``.
+
+        This remainder-driven approach handles multi-way branches without manual negation and
+        naturally prunes infeasible siblings (those for which ``get_model`` returns ``None``).
 
         Args:
             init: The same initial symbolic configuration used to produce `trace`.
-            trace: A previously recorded trace whose branches should be flipped.
+            trace: A previously recorded trace whose sibling branches should be explored.
 
         Returns:
-            The list of feasible new inputs, one per flippable branch (infeasible flips are dropped).
+            The list of feasible new inputs; infeasible sibling branches are dropped.
         """
         results: list[Subst] = []
         for i, pc in enumerate(trace.path):
             prefix = [trace.path[j].condition for j in range(i)]
-            constraints = prefix + [mlNot(pc.condition)]
-            constrained = init
-            for constraint in constraints:
-                constrained = constrained.add_constraint(constraint)
-
-            model = self.cterm_symbolic.get_model(constrained, module_name=self.module_name)
-            if model is None:
-                _LOGGER.debug(f'Flipping branch {i} is infeasible')
-                continue
-            results.append(self._restrict_to_inputs(model))
+            for sibling in pc.siblings:
+                constraints = prefix + [sibling]
+                constrained = init
+                for constraint in constraints:
+                    constrained = constrained.add_constraint(constraint)
+                model = self.cterm_symbolic.get_model(constrained, module_name=self.module_name)
+                if model is None:
+                    _LOGGER.debug(f'Sibling branch at node {i} is infeasible; skipping')
+                    continue
+                results.append(self._restrict_to_inputs(model))
         return results
 
     def explore(self, init: CTerm, seed_input: Subst, *, max_iterations: int = 50) -> list[ConcolicTrace]:
         """Run the concolic exploration loop, discovering distinct execution paths from a seed input.
 
         Maintains a worklist of concrete inputs, traces each one, and enqueues the inputs synthesized
-        by flipping its branches -- skipping inputs whose path condition was already seen. Bounded by
-        `max_iterations` so the loop always terminates.
+        by solving prefix conditions against sibling (remainder) conditions -- skipping inputs whose
+        path condition was already seen. Bounded by `max_iterations` so the loop always terminates.
 
         Args:
             init: The initial symbolic configuration with `input_vars` free.
@@ -261,7 +294,7 @@ class ConcolicEngine:
             seen_signatures.add(trace.signature)
             traces.append(trace)
 
-            for new_input in self.flipped_inputs(init, trace):
+            for new_input in self.diverging_inputs(init, trace):
                 worklist.append(new_input)
 
         return traces
@@ -292,14 +325,28 @@ class ConcolicEngine:
         next_states: Iterable[State],
         rule_trace: tuple[str, ...],
         trace_idx: int,
-    ) -> tuple[State | None, int]:
+    ) -> tuple[State | None, list[State], int]:
+        """Select the branch successor whose rule id appears next in the concrete rule trace.
+
+        Args:
+            next_states: The successor states returned by a symbolic ``execute`` call at a branch.
+            rule_trace: The full ordered rule id sequence from the concrete pass.
+            trace_idx: The current position in ``rule_trace`` (entries before this index are already
+                consumed by earlier branch decisions).
+
+        Returns:
+            A triple ``(chosen, siblings, new_idx)`` where ``chosen`` is the matched successor (or
+            ``None`` if no match was found), ``siblings`` is the list of non-chosen successors, and
+            ``new_idx`` is the updated trace index (advanced past the matched entry).
+        """
         states = list(next_states)
         candidates = {s.rule_id: s for s in states if s.rule_id is not None}
         for k in range(trace_idx, len(rule_trace)):
             match = candidates.get(rule_trace[k])
             if match is not None:
-                return match, k + 1
-        return None, trace_idx
+                siblings = [s for s in states if s is not match]
+                return match, siblings, k + 1
+        return None, [], trace_idx
 
     def _restrict_to_inputs(self, model: Subst) -> Subst:
         return Subst({var: term for var, term in model.items() if var in self.input_vars})

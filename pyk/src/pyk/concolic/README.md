@@ -11,8 +11,9 @@ It does **not** add a new backend. The defining idea is that a fast, determinist
 run produces an execution trace, which is then **reused** to drive a *symbolic* run down the
 very same path. Because the concrete trace already records which rule fired at every branch, the
 symbolic pass selects each branch by **matching rule ids** — it never asks the SMT solver "which
-branch does this input take?". The solver is consulted only at the end, to negate a prefix of
-the path condition and synthesize a new input (the classic DART/SAGE loop).
+branch does this input take?". The solver is consulted only to synthesize a new input that
+diverges from the current path, by solving a path prefix against a sibling (remainder) condition
+`rk` recorded at a branch node (the classic DART/SAGE loop).
 
 ## How it works
 
@@ -30,10 +31,13 @@ initial symbolic configuration with free *input variables* and a concrete assign
    simplify call**. (This pass uses the lower-level `KoreClient` directly, because the
    `CTermSymbolic` wrapper drops `rule_id` from successors.)
 
-3. **`flipped_inputs(init, trace)`** — For each branch `i` along the recorded path, build the
-   constraint set `c_0 & … & c_(i-1) & ¬c_i` and ask `CTermSymbolic.get_model` for a satisfying
-   assignment over the input variables. Each feasible model is a new concrete input that diverges
-   from `trace` at branch `i`.
+3. **`diverging_inputs(init, trace)`** — For each branch `i` along the recorded path, and for each
+   sibling (remainder) condition `rk` recorded at that node, build the constraint set
+   `c_0 & … & c_(i-1) & rk` and ask `CTermSymbolic.get_model` for a satisfying assignment over the
+   input variables. Each feasible model is a new concrete input that follows the same path up to
+   branch `i`, then diverges to the sibling branch guarded by `rk`. Infeasible siblings are pruned
+   automatically (`get_model` returns `None`). Using the backend-provided sibling predicates (rather
+   than negating `c_i`) handles multi-way branches correctly.
 
 4. **`explore(init, seed_input)`** — A bounded worklist loop: trace an input, enqueue the inputs
    produced by flipping its branches, skip inputs whose path condition was already seen, and stop
@@ -68,7 +72,7 @@ flowchart TB
         subgraph API["Public methods"]
             M0["concrete_trace(init, input)<br/>ground run -> ordered rule-id trace"]
             M1["trace(init, input)<br/>symbolic replay, select branch by rule-id"]
-            M2["flipped_inputs(init, trace)<br/>negate path prefix -> solve for new inputs"]
+            M2["diverging_inputs(init, trace)<br/>solve prefix & sibling remainder -> new inputs"]
             M3["explore(init, seed_input)<br/>worklist loop + path dedup"]
         end
         subgraph Helpers["Internal helpers"]
@@ -139,11 +143,11 @@ flowchart TD
     Sig -->|yes| Cond
     Sig -->|no| Record["seen.add(signature)<br/>traces.append(trace)"]
 
-    Record --> Flip["flipped_inputs(init, trace)"]
+    Record --> Flip["diverging_inputs(init, trace)"]
 
-    subgraph FlipLoop["flipped_inputs: synthesize diverging inputs"]
+    subgraph FlipLoop["diverging_inputs: synthesize diverging inputs"]
         direction TB
-        FS["for each branch i on the path"] --> FC["build constraints:<br/>c0 & ... & c(i-1) & not ci"]
+        FS["for each branch i, each sibling rk"] --> FC["build constraints:<br/>c0 & ... & c(i-1) & rk"]
         FC --> GM["CTermSymbolic.get_model(constraints)<br/>(Z3 solve)"]
         GM --> Feas{"satisfiable?"}
         Feas -->|yes| Add["trim to input variables<br/>-> new concrete input"]

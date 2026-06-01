@@ -159,17 +159,27 @@ ConcolicEngine
   explore(init, seed)           -> [ConcolicTrace]             (worklist + signature dedup)
 ```
 
-`flipped_inputs` (v0) is subsumed: branch discovery and the diverging input both come from the backend
-`rk`, instead of the engine post-hoc negating recorded conditions.
+Branch discovery and the diverging input both come from the sibling (remainder) predicates `rk`
+recorded at each branch node, instead of the engine post-hoc negating the chosen condition. The
+sibling predicates are already returned by the existing `execute` (each successor carries its
+`rule_predicate`), so **the remainder-driven loop needs no backend change** — see *Current status* and
+*Milestones*. The guided-step backend feature is a performance optimization on top of this.
 
 ## Backend changes required
 
-**Haskell backend / Booster (v1, required):**
+**Haskell backend / Booster (v1, optimization — not required for correctness):**
 
-- New *guided-step* capability: apply a specified `rule-id` for one step, returning the rewritten
-  symbolic term, `applied-predicate` (`ck`), and `remainder-predicate` (`rk`); no rule search, no
-  branching, no feasibility SMT. Lands in the `haskell-backend` repo (RPC schema + rewrite engine) and
-  in pyk's `KoreClient`.
+The remainder-driven loop already works on the existing `execute`: at a branch, Booster returns each
+successor with its `rule_predicate` (the siblings = `rk`), and it already computes a *remainder
+predicate* internally (`Rewrite.hs`: `RewriteBranch` is returned only when a rule group's remainder is
+unsatisfiable; a satisfiable remainder currently *aborts*). The optimization:
+
+- A guided/forced-rule mode on `execute` (extra request field) that, given the concrete trace's rule
+  sequence, applies the named rule per step **without** the per-branch feasibility SMT (feasibility is
+  witnessed by the concrete run), and surfaces the `remainder-predicate` Booster already computes
+  (including the fall-through/`owise` region it currently aborts on) so the engine can also generate
+  inputs for it. Surface: `kore-rpc-types/Types.hs`, `booster/JsonRpc.hs`, `booster/JsonRpc/Utils.hs`,
+  `kore/JsonRpc.hs`, plus pyk's `KoreClient`.
 
 **LLVM backend (v2 / v3, optional optimizations):**
 
@@ -181,25 +191,29 @@ ConcolicEngine
 
 ## Milestones
 
-- **v0 (done, no backend change):** concrete pass via ground `execute`; symbolic replay via existing
-  `execute`, selecting the branch by matching `rule_id` against the concrete trace; diverging inputs
-  via post-hoc negation (`flipped_inputs`). Works on legacy + Booster; still forks internally.
-- **v1 (target):** Haskell guided-step (`ck` + `rk`); deterministic replay, no fork, SMT only at
-  branch nodes; remainder-driven branch discovery replaces `flipped_inputs`.
+- **v1 (done, no backend change):** concrete pass via ground `execute`; symbolic replay via existing
+  `execute`, selecting the branch by matching `rule_id` against the concrete trace; **remainder-driven**
+  diverging-input generation (`diverging_inputs`) using the sibling `rule_predicate`s returned at each
+  branch. Works on legacy + Booster; the backend still forks/checks feasibility internally.
+- **v1.1 (optimization):** guided/forced-rule mode on `execute` so the forward replay skips per-branch
+  feasibility SMT and surfaces Booster's remainder (incl. the `owise` fall-through it currently aborts on).
 - **v2:** LLVM proof hints (+ ordinal→id) as the concrete-trace source for a faster concrete pass.
 - **v3:** LLVM concolic mode (Option B).
 
-Suggested first implementation step: a spike confirming the guided-step contract on Booster (apply a
-named rule, read back `ck`/`rk`) on the IMP example, then wire the engine's replay onto it.
+Suggested next implementation step (v1.1): a spike confirming the forced-rule + remainder contract on
+Booster on the IMP example, then wiring the engine's replay onto it.
 
-## Current status (v0)
+## Current status (v1, remainder-driven)
 
-`_engine.py` implements v0: `concrete_trace` (ground run → rule-id sequence) and a `trace` that replays
-symbolically by selecting branches via `rule_id` matching, plus `flipped_inputs` / `explore`. It is
+`_engine.py` implements: `concrete_trace` (ground run → rule-id sequence), `trace` (symbolic replay
+selecting branches via `rule_id` matching, recording each chosen condition `ck` and the sibling
+remainder conditions `rk`), `diverging_inputs` (solve `prefix ∧ rk` per sibling), and `explore`
+(worklist + signature dedup). It is
 validated by `src/tests/unit/test_concolic.py` (trace-matching logic) and
-`src/tests/integration/concolic/test_imp_concolic.py` (end-to-end on IMP, legacy + Booster). The v0 →
-v1 step replaces the internal `execute`-and-select with the guided-step RPC and switches branch
-discovery to backend-provided remainders.
+`src/tests/integration/concolic/test_imp_concolic.py` (end-to-end on IMP, single- and two-branch
+programs, legacy + Booster — the two-branch test confirms exactly the three feasible leaves are found
+and the UNSAT one is pruned). The next (v1.1) step replaces the internal `execute`-and-select with the
+forced-rule mode so the forward replay drops per-branch feasibility SMT.
 
 ## Scope & limitations
 

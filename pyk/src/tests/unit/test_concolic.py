@@ -42,19 +42,23 @@ def _engine() -> ConcolicEngine:
 def test_match_branch_picks_rule_from_trace() -> None:
     # Candidates are the two branch successors; the concrete trace took 'else'.
     states = _states('then-id', 'else-id')
-    chosen, idx = ConcolicEngine._match_branch(states, ('lookup', 'le', 'else-id', 'assign'), 0)
+    chosen, siblings, idx = ConcolicEngine._match_branch(states, ('lookup', 'le', 'else-id', 'assign'), 0)
     assert chosen is not None
     assert chosen.rule_id == 'else-id'
     assert idx == 3  # pointer advanced past the matched entry
+    assert len(siblings) == 1
+    assert siblings[0].rule_id == 'then-id'
 
 
 def test_match_branch_respects_start_index() -> None:
     # An earlier 'else-id' in the trace must be ignored once the pointer has moved past it.
     states = _states('then-id', 'else-id')
-    chosen, idx = ConcolicEngine._match_branch(states, ('else-id', 'then-id'), 1)
+    chosen, siblings, idx = ConcolicEngine._match_branch(states, ('else-id', 'then-id'), 1)
     assert chosen is not None
     assert chosen.rule_id == 'then-id'
     assert idx == 2
+    assert len(siblings) == 1
+    assert siblings[0].rule_id == 'else-id'
 
 
 def test_match_branch_handles_loops() -> None:
@@ -62,20 +66,24 @@ def test_match_branch_handles_loops() -> None:
     states = _states('body-id', 'exit-id')
     trace = ('body-id', 'body-id', 'exit-id')
 
-    first, idx = ConcolicEngine._match_branch(states, trace, 0)
+    first, siblings_1, idx = ConcolicEngine._match_branch(states, trace, 0)
     assert first is not None and first.rule_id == 'body-id' and idx == 1
+    assert len(siblings_1) == 1 and siblings_1[0].rule_id == 'exit-id'
 
-    second, idx = ConcolicEngine._match_branch(states, trace, idx)
+    second, siblings_2, idx = ConcolicEngine._match_branch(states, trace, idx)
     assert second is not None and second.rule_id == 'body-id' and idx == 2
+    assert len(siblings_2) == 1 and siblings_2[0].rule_id == 'exit-id'
 
-    third, idx = ConcolicEngine._match_branch(states, trace, idx)
+    third, siblings_3, idx = ConcolicEngine._match_branch(states, trace, idx)
     assert third is not None and third.rule_id == 'exit-id' and idx == 3
+    assert len(siblings_3) == 1 and siblings_3[0].rule_id == 'body-id'
 
 
 def test_match_branch_no_match_returns_none() -> None:
     states = _states('then-id', 'else-id')
-    chosen, idx = ConcolicEngine._match_branch(states, ('lookup', 'le', 'assign'), 0)
+    chosen, siblings, idx = ConcolicEngine._match_branch(states, ('lookup', 'le', 'assign'), 0)
     assert chosen is None
+    assert siblings == []
     assert idx == 0  # pointer unchanged
 
 
