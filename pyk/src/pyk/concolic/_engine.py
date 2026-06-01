@@ -102,6 +102,7 @@ class ConcolicEngine:
         max_step: Maximum rewrite depth per `execute` call.
         max_branches: Safety bound on the number of branch points followed in a single trace.
         module_name: Optional Kore module name to evaluate against.
+        assume_remainder_unsat: Pass the `assume-remainder-unsat` flag to `execute` during replay (skips per-branch remainder-feasibility SMT on a supporting backend; harmless otherwise).
     """
 
     cterm_symbolic: CTermSymbolic
@@ -109,6 +110,7 @@ class ConcolicEngine:
     max_step: int
     max_branches: int
     module_name: str | None
+    assume_remainder_unsat: bool
 
     def __init__(
         self,
@@ -118,12 +120,14 @@ class ConcolicEngine:
         max_step: int = 1000,
         max_branches: int = 100,
         module_name: str | None = None,
+        assume_remainder_unsat: bool = True,
     ) -> None:
         self.cterm_symbolic = cterm_symbolic
         self.input_vars = tuple(input_vars)
         self.max_step = max_step
         self.max_branches = max_branches
         self.module_name = module_name
+        self.assume_remainder_unsat = assume_remainder_unsat
 
     def concrete_trace(self, init: CTerm, concrete_input: Subst) -> tuple[str, ...]:
         """Run `init` concretely under `concrete_input` and return the ordered rule ids applied.
@@ -307,6 +311,7 @@ class ConcolicEngine:
             max_depth=self.max_step,
             module_name=self.module_name,
             log_successful_rewrites=True,
+            assume_remainder_unsat=self.assume_remainder_unsat,
         )
 
     def _to_cterm(self, state: State) -> CTerm:

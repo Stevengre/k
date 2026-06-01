@@ -958,6 +958,7 @@ class KoreClient(ContextManager['KoreClient']):
         *,
         max_depth: int | None = None,
         assume_state_defined: bool | None = None,
+        assume_remainder_unsat: bool | None = None,
         cut_point_rules: Iterable[str] | None = None,
         terminal_rules: Iterable[str] | None = None,
         moving_average_step_timeout: bool | None = None,
@@ -970,6 +971,7 @@ class KoreClient(ContextManager['KoreClient']):
             {
                 'max-depth': max_depth,
                 'assume-state-defined': assume_state_defined,
+                'assume-remainder-unsat': assume_remainder_unsat,
                 'cut-point-rules': list(cut_point_rules) if cut_point_rules is not None else None,
                 'terminal-rules': list(terminal_rules) if terminal_rules is not None else None,
                 'moving-average-step-timeout': moving_average_step_timeout,
